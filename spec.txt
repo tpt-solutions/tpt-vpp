@@ -1,0 +1,164 @@
+tpt-vpp — Design Specification
+Version: 0.1.0-draft
+Status: RFC
+Owner: Solo maintainer
+Stack: Go (concurrency layer) · Rust (decision engine) · TypeScript/PHP (platform)
+1. Vision
+tpt-vpp is a universal, agentic energy arbitrage platform. It connects to heterogeneous battery/EV hardware (Aotea, Tesla Powerwall, Anker Solix, BYD, etc.) and autonomously schedules charging/discharging to minimize cost against real-time wholesale electricity spot prices.
+Core thesis: The hardware is fragmented and dumb. The logic of when to move electrons is universal, deterministic, and solvable. Own the logic layer.
+Non-goals (v1):
+Hardware manufacturing
+Becoming a registered electricity retailer
+Peer-to-peer energy trading
+2. High-Level Architecture
+
+┌──────────────────────────────────────────────────────────┐
+│                     User Platform (TS/PHP)                │
+│   • Device onboarding   • Savings dashboard   • Alerts   │
+└──────────────────────────┬───────────────────────────────┘
+                           │ REST / WebSocket
+┌──────────────────────────▼───────────────────────────────┐
+│                   tpt-vpp Orchestrator (Go)               │
+│   • Device registry   • Session management   • Telemetry │
+└────────┬─────────────────────────────────┬───────────────┘
+         │                                 │
+         ▼                                 ▼
+┌────────────────────────┐      ┌──────────────────────────┐
+│  Price Ingest Service  │      │   Device Adapter Fleet   │
+│  (Go, tpt-swarm-style) │      │   (Go, per-vendor)       │
+│  • EA EMI poller       │      │  • Tesla, BYD, Anker,    │
+│  • EM6 fallback        │      │    Aotea, Powerwall...   │
+│  • Lines-charge loader │      │  • Normalizes to unified │
+└──────────┬─────────────┘      │    DeviceState schema    │
+           │                    └──────────┬───────────────┘
+           │                              │
+           ▼                              ▼
+┌──────────────────────────────────────────────────────────┐
+│              Decision Engine (Rust, tpt-lang derived)     │
+│   • Constraint solver   • Formal policy evaluation       │
+│   • Deterministic, auditable charge/discharge decisions  │
+└──────────────────────────────────────────────────────────┘
+
+3. Core Components
+3.1 Price Ingest Service (Go)
+A tpt-swarm-style worker pool that continuously polls:
+
+Source
+Data
+Frequency
+Electricity Authority EMI
+Wholesale spot (half-hourly + 5-min)
+30s
+EM6 (commercial fallback)
+Forecast + historical
+5min
+Lines-company tariff API
+Variable + fixed network charges per ICP
+Daily
+Output: A unified FullyLoadedRate struct per ICP, updated every 5 minutes:
+
+type FullyLoadedRate struct {
+    ICP             string
+    Timestamp       time.Time
+    WholesaleCents  float64  // ¢/kWh
+    LinesVariable   float64
+    LinesFixed      float64  // amortized per-kWh for decision window
+    RetailerMargin  float64
+    TotalCents      float64
+    IsForecast      bool
+}
+
+3.2 Device Adapter Fleet (Go)
+One adapter per vendor. Each normalizes vendor-specific APIs into a unified schema:
+
+// The canonical device state — defined in Rust, consumed by decision engine
+struct DeviceState {
+    device_id:     Uuid,
+    vendor:        Vendor,
+    soc_percent:   f32,       // 0.0 - 100.0
+    max_capacity_kwh: f32,
+    current_charge_kw: f32,   // negative = discharging
+    max_charge_kw:     f32,
+    max_discharge_kw:  f32,
+    is_plugged_in:     bool,  // relevant for EVs
+    grid_connected:    bool,
+    controllable:      bool,  // can we send commands?
+}
+
+Adapter priorities for MVP:
+Tesla Powerwall — local HTTP API, well-documented, community wrappers exist
+Aotea AE-1 — if they expose any API; otherwise reverse-engineer the app
+BYD Atto 2/3 — cloud API via community wrappers
+Each adapter runs as an isolated Go microservice. Crashes in one vendor's API don't affect others.
+3.3 Decision Engine (Rust)
+This is the unfair advantage. Built on principles from tpt-lang: formally specified, deterministic, auditable.
+Why Rust + formal methods here?
+Energy decisions have financial consequences. A bug that charges at 80¢/kWh instead of 4¢/kWh is a real user harm.
+The decision space is a constraint satisfaction problem, not a pile of if/else.
+Every decision must be reproducible and explainable ("Why did it charge at 3:14 AM?").
+Policy DSL (formal contracts):
+
+// Example policy, evaluated every 5 minutes
+policy ChargeWhenCheap {
+    requires {
+        rate.total_cents < user.max_price_cents,
+        device.soc_percent < user.target_soc_percent,
+        device.is_plugged_in || device.vendor == Vendor::HomeBattery,
+        device.grid_connected,
+    }
+    ensures {
+        device.charge_rate_kw <= device.max_charge_kw,
+        device.soc_percent <= 100.0,
+    }
+    action {
+        SetChargeRate(kw: optimal_rate(device, rate))
+    }
+}
+
+The solver proves the policy's preconditions hold before emitting any command. If a precondition fails, no action is taken — fail-safe by construction.
+Audit log: Every decision emits a cryptographically chained event:
+
+{ ts, device_id, rate_snapshot, policy_id, preconditions_proven, action_taken }
+
+Users can replay any decision and see exactly why it was made.
+3.4 User Platform (TypeScript / PHP)
+Onboarding flow: OAuth into device vendor → ICP lookup → tariff selection → policy configuration
+Dashboard: Real-time state of all devices, spot price graph, savings vs. "dumb charging" baseline
+Policy editor: Sliders for max_price_cents, target_soc_percent, reserve_floor_percent
+Alerts: "Price spike detected — all devices paused", "Car fully charged at 6¢/kWh, saved $4.20"
+4. Data Flow (5-Minute Cycle)
+
+T+0:00  Price Ingest fetches new spot rate + forecast
+T+0:05  Device Adapters poll all connected hardware
+T+0:10  Orchestrator assembles (rate, device_states) tuple
+T+0:11  Decision Engine evaluates policies, emits actions
+T+0:12  Orchestrator dispatches commands to adapters
+T+0:15  Adapters confirm execution (or report failure)
+T+0:16  Telemetry persisted, audit log appended
+
+5. MVP Scope (12-week plan)
+Weeks 1–4: Price Ingest (EA EMI only) + Tesla Powerwall adapter + Decision Engine skeleton
+Weeks 5–8: Add 1 more adapter (Aotea OR BYD) + basic TS dashboard
+Weeks 9–12: Policy DSL v1 + audit log + closed beta with 10 real users
+Success metric: Prove ≥15% cost reduction vs. time-of-use baseline over 30 days for beta users.
+
+6. Open Questions / Risks
+Risk
+Mitigation
+Vendor APIs break or change
+Adapter isolation + contract tests per vendor + alerting on schema drift
+Lines-company tariffs are opaque / non-API
+Start with ICPs where tariffs are public; manual CSV upload fallback
+Wholesale price forecasting is hard
+v1 doesn't forecast — reacts to current price. Forecast is v2.
+User trust ("why is my car not charging?")
+Audit log + plain-English decision explanations in UI
+Regulatory (is this "retailing"?)
+Legal review pre-launch. v1 is user-side optimization only, no energy flows through us.
+Aotea / BYD APIs are closed
+Community reverse-engineering + graceful degradation to "advisory mode" (app tells user what to do)
+7. Licensing Strategy
+Decision Engine (Rust): Proprietary. This is the moat.
+Device Adapters (Go): Open-source under MIT Apache. Incentivizes community contributions, protects against cloud providers wrapping your work.
+Price Ingest (Go): Open-source. Commodity data pipeline; community helps maintain vendor quirks.
+User Platform (TS/PHP): Proprietary.
